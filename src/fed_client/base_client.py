@@ -1,0 +1,229 @@
+from torch.utils.data import DataLoader, RandomSampler
+import torch.nn.functional as F
+import time
+import numpy as np
+import torch.nn as nn
+import torch
+import copy
+from src.cost import ClientAttr, Cost
+import math
+from src.models.model import choose_model
+from src.optimizers.gd import GD
+from src.utils.torch_utils import get_flat_grad, get_state_dict, get_flat_params_from, set_flat_params_to
+
+
+criterion = F.cross_entropy
+mse_loss = nn.MSELoss()
+from src.utils.torch_utils import *
+class Client():
+    def __init__(self, options, id, model, optimizer, local_dataset, system_attr):
+        self.options = options
+        self.id = id
+        self.local_dataset = local_dataset
+        self.gpu = options['gpu']
+        self.attr_dict = system_attr.get_client_attr(self.id)
+        self.local_data_class_distribution, self.class_is_own = self.get_local_data_class_distribution()
+        self.iterations = self.get_iterations()
+        self.model = model
+        self.optimizer = optimizer
+        #print(self.iterations)
+        # self.max_iterations = max_iterations
+        # self.__pre_work(self.options)
+
+    # def __pre_work(self, options):
+    #     self.model = choose_model(options)
+    #     # self.move_model_to_gpu(model, options)
+    #     self.optimizer = GD(self.model.parameters(), lr=options['lr']) 
+    #     self.move_model_to_gpu(self.model, options)
+
+    # @staticmethod
+    # def move_model_to_gpu(model, options):
+    #     if options['gpu'] >= 0:
+    #         device = options['gpu']
+    #         torch.cuda.set_device(device)
+    #         # torch.backends.cudnn.enabled = True
+    #         model.cuda()
+    #     #     print('>>> Use gpu on device {}'.format(device))
+    #     # else:
+    #     #     print('>>> Don not use gpu')
+
+    def get_iterations(self, ):
+        iterations = math.ceil(len(self.local_dataset) / self.options['batch_size'])
+        return iterations
+
+    def get_local_data_class_distribution(self):
+        class_num = 10
+        if self.options['dataset_name'] == "emnist":
+            class_num = 47
+        if self.options['dataset_name'] == "cifar100":
+            class_num = 20
+        class_distribution = [0 for _ in range(class_num)] # 多少个类别
+        class_own = [0 for _ in range(class_num)]
+        for i in range(len(self.local_dataset)):
+            site = self.local_dataset[i][1]
+            class_distribution[site] += 1
+        for i in range(len(class_distribution)):
+            if class_distribution[i] > 0:
+                class_own[i] = 1
+        return class_distribution, class_own
+
+    def get_flat_model_params(self):
+        flat_params = get_flat_params_from(self.model)
+        return flat_params.detach()
+
+        
+    def get_model_parameters(self):
+        state_dict = self.model.state_dict()
+        return state_dict
+
+    def set_model_parameters(self, model_parameters_dict):
+        state_dict = self.model.state_dict()
+        for key, value in state_dict.items():
+            state_dict[key] = model_parameters_dict[key]
+        self.model.load_state_dict(state_dict)
+
+    def load_model_parameters(self, file):
+        model_params_dict = get_state_dict(file)
+        self.set_model_params(model_params_dict)
+    
+    def get_flat_model_params(self):
+        flat_feature_extractor_params = get_flat_params_from(self.model.feature_extractor)
+        flat_classifier_params = get_flat_params_from(self.model.classifier)
+        return torch.cat((flat_feature_extractor_params, flat_classifier_params)).detach()
+
+    def set_flat_model_params(self, flat_params):
+        set_flat_params_to(self.model, flat_params)
+
+    def get_flat_gradients(self, dataloader):
+        self.optimizer.zero_grad()
+        loss, total_num = 0., 0
+        for x, y in dataloader:            
+            x = self.flatten_data(x)
+            if self.gpu >= 0:
+                x, y = x.cuda(), y.cuda()
+            pred = self.model(x)
+            loss += criterion(pred, y) * y.size(0)
+            total_num += y.size(0)
+        loss /= total_num
+
+        flat_grads = get_flat_grad(loss, self.model.parameters(), create_graph=True)
+        return flat_grads
+
+
+    def local_train(self, round_i):
+        begin_time = time.time()
+        # print("更新前", self.get_flat_model_params())
+        local_model_paras, dict = self.local_update(self.local_dataset, self.options, round_i)
+        # print("更新后", self.get_flat_model_params())
+        end_time = time.time()
+        stats = {'id': self.id, "time": round(end_time - begin_time, 2)}
+        stats.update(dict)
+        return (len(self.local_dataset), self.id, local_model_paras), stats
+
+    def local_update(self, local_dataset, options,  round_i):
+        local_seed = 2025 + round_i  # 例如根据 round_i 保证每一轮不同，但可控
+        # 创建本地随机生成器
+        g = torch.Generator()
+        g.manual_seed(local_seed)
+
+        if options['batch_size'] == -1:
+            localTrainDataLoader = DataLoader(local_dataset, batch_size=len(local_dataset), shuffle=True, generator=g)
+        else:
+            if len(local_dataset) < options['batch_size']:
+                localTrainDataLoader = DataLoader(local_dataset, batch_size=len(local_dataset), shuffle=True, generator=g)
+            else:
+
+                sampler = RandomSampler(local_dataset, replacement=False, num_samples=options['batch_size'], generator=g)
+                # indices = list(sampler)
+                # print("被抽取的样本编号:", indices)
+                localTrainDataLoader = DataLoader(local_dataset, batch_size=options['batch_size'], sampler=sampler)
+        self.model.train()
+        train_loss = train_acc = train_total = 0
+        for epoch in range(options['local_epoch']):
+            train_loss = train_acc = train_total = 0
+            for X, y in localTrainDataLoader:
+                if self.gpu >= 0:
+                    X, y = X.cuda(), y.cuda()
+                self.optimizer.zero_grad()
+                _, pred = self.model(X)
+                loss = criterion(pred, y)
+                loss.backward()
+                self.optimizer.step()
+
+                _, predicted = torch.max(pred, 1)
+                correct = predicted.eq(y).sum().item()
+                target_size = y.size(0)
+                train_loss += loss.item() * y.size(0)
+                train_acc += correct
+                train_total += target_size
+           # local_model_paras = self.get_model_parameters()   
+        local_model_paras = self.get_flat_model_params()
+        # local_model_paras = copy.deepcopy(self.get_model_parameters())
+        return_dict = {"id": self.id,
+                       "loss": train_loss / train_total,
+                       "acc": train_acc / train_total}
+        # print("更新后", self.get_flat_model_params())
+        return local_model_paras, return_dict
+    
+
+    def getLocalEngery(self, round_i):
+        if self.options['batch_size'] == -1 or len(self.local_dataset) < self.options['batch_size']:
+            dataset_len = len(self.local_dataset)
+        else:
+            dataset_len = self.options['batch_size']
+        localEngery = (10 ** -26) * (self.attr_dict['cpu_frequency'][round_i] * 10 ** 9) ** 2 * self.options['C'] * dataset_len * self.options['local_epoch']
+        return localEngery
+
+    def getUploadEngery(self, round_i, bandwidth):
+        uploadEngery = self.attr_dict['transmit_power'] * self.getUploadDelay(round_i, bandwidth)
+        return uploadEngery
+
+    def getLocalDelay(self, round_i): 
+        if self.options['batch_size'] == -1 or len(self.local_dataset) < self.options['batch_size']:
+            dataset_len = len(self.local_dataset)
+        else:
+            dataset_len = self.options['batch_size']
+        localDelay = (self.options['C'] * dataset_len * self.options['local_epoch']) / (self.attr_dict['cpu_frequency'][round_i] * 10 ** 9)
+        # print(localDelay)
+        return localDelay
+
+    def getUploadDelay(self, round_i, bandwidth):  # 需要修改
+        # N0 = -174 dBm/Hz = 10^(-17.4) mW/Hz = 10^(-20.4) W/Hz
+        # q_v = [0, 23] dBm = 10^(q_v/10) mW = 10^((q_v-30)/10) W
+        # h_v = −97.3 dB = 10^(-9.73)    
+        # （q_v h_v / bandwidth * N0）
+        R_K =  bandwidth * 1000000 * np.log2(1 + (10 ** ((self.attr_dict['transmit_power'] - 30) /10) * 10 ** (-9.73)) / (bandwidth * 1000000 * (10 ** (-20.4))))
+        # print("R_K", R_K)
+        uploadDelay = self.options['model_size'] / (R_K / 8 / 1024 / 1024) # 100KB 0.1M  # 1S
+        return uploadDelay
+
+    # def getSumEngery(self, round_i):
+    #     return self.getUploadEngery(round_i) + self.getLocalEngery(round_i)
+
+    # def getSumDelay(self, round_i):
+    #     return self.getUploadDelay(round_i) + self.getLocalDelay(round_i)
+
+    def get_loss(self, local_dataset, options):
+        if options['batch_size'] == 100:
+            localTrainDataLoader = DataLoader(local_dataset, batch_size=len(local_dataset), shuffle=True)
+        else:
+            localTrainDataLoader = DataLoader(local_dataset, batch_size=options['batch_size'], shuffle=True)
+        train_loss = train_acc = train_total = 0
+        with torch.no_grad():
+            train_loss = train_acc = train_total = 0
+            for X, y in localTrainDataLoader:
+                if self.gpu >= 0:
+                    X, y = X.cuda(), y.cuda()
+                pred = self.model(X)
+                loss = criterion(pred, y)
+                _, predicted = torch.max(pred, 1)
+                correct = predicted.eq(y).sum().item()
+                target_size = y.size(0)
+                train_loss += loss.item() * y.size(0)
+                train_acc += correct
+                train_total += target_size    
+        return train_loss / train_total   
+
+    def get_pre_loss(self,):
+        pre_loss = self.get_loss(self.local_dataset, self.options)
+        return pre_loss
