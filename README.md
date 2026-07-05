@@ -1,6 +1,6 @@
 ## Accelerating Federated Learning under Client Dropout via Joint Bandwidth Allocation and Prototype Fine-Tuning in Mobile Edge Computing Networks
 
-The paper has been submitted by IEEE Trans. Mobile Comput. 
+This paper has been accepted by IEEE Trans. Mobile Comput. 
 
 
 **Title:** Accelerating Federated Learning under Client Dropout via Joint Bandwidth Allocation and Prototype Fine-Tuning in Mobile Edge Computing Networks
